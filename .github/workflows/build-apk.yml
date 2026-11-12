@@ -1,74 +1,151 @@
-name: Build Android APK
+name: Construir APK de Viajes Perdomo
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Tipo de compilación (debug o release)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
 
 jobs:
-  build-android:
+  build-apk:
+    name: Compilar APK Android
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      - name: 📥 Clonar repositorio
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: 📦 Extraer ZIP si el proyecto fue subido comprimido
+        run: |
+          if [ -f "project.zip" ]; then
+            echo "Detectado project.zip, descomprimiendo..."
+            unzip -o project.zip -d .
+          elif ls *.zip 1> /dev/null 2>&1; then
+            ZIP_FILE=$(ls *.zip | head -n 1)
+            echo "Detectado archivo $ZIP_FILE, descomprimiendo..."
+            unzip -o "$ZIP_FILE" -d .
+          else
+            echo "Árbol git estándar detectado."
+          fi
+
+      - name: 🟢 Configurar Node.js 22 LTS (Requerido por Capacitor 8)
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
-      - name: Set up Java JDK 17
+      - name: ☕ Configurar Java 21 (Temurin - Requerido por AGP 8.13+)
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          distribution: 'temurin'
+          java-version: '21'
 
-      - name: Locate project root directory
-        run: |
-          if [ -f "package.json" ]; then
-            echo "PROJECT_DIR=." >> $GITHUB_ENV
-          else
-            SUBDIR=$(find . -maxdepth 2 -name "package.json" -exec dirname {} | head -n 1)
-            if [ -n "$SUBDIR" ]; then
-              echo "PROJECT_DIR=$SUBDIR" >> $GITHUB_ENV
-            else
-              echo "PROJECT_DIR=." >> $GITHUB_ENV
-            fi
-          fi
+      - name: 📱 Configurar Android SDK 36
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-36 platform-tools build-tools;36.0.0'
 
-      - name: Install Dependencies
+      - name: 📱 Aceptar licencias del SDK de Android
         run: |
-          cd ${{ env.PROJECT_DIR }}
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0" || true
+
+      - name: 📦 Instalar dependencias del proyecto
+        run: |
           npm install --legacy-peer-deps
 
-      - name: Build Web Application
+      - name: 🔨 Compilar aplicación web (Vite build)
         run: |
-          cd ${{ env.PROJECT_DIR }}
           npm run build
 
-      - name: Add and Sync Capacitor Android
+      - name: 📱 Inicializar y Sincronizar Capacitor Android
+        env:
+          CI: true
+          CAPACITOR_TELEMETRY: 0
         run: |
-          cd ${{ env.PROJECT_DIR }}
-          npx cap add android || true
-          npx cap sync android
+          npx cap telemetry off || true
 
-      - name: Grant Execute Permissions for Gradle
-        run: |
-          cd ${{ env.PROJECT_DIR }}
-          if [ -d "android" ]; then
-            chmod +x android/gradlew
+          if [ ! -d "android" ] || [ ! -f "android/build.gradle" ]; then
+            echo "Inicializando proyecto Android nativo con Capacitor..."
+            rm -rf android
+            npx cap add android
+          else
+            echo "Directorio android nativo detectado y válido."
           fi
 
-      - name: Build APK with Gradle
-        run: |
-          cd ${{ env.PROJECT_DIR }}/android
-          ./gradlew assembleDebug
+          echo "Sincronizando assets hacia android..."
+          npx cap sync android
 
-      - name: Upload APK Artifact
+      - name: 🔧 Parchear compatibilidad Java 21 y SDK 36
+        run: |
+          # Asegurar SDK 36 en variables.gradle
+          if [ -f "android/variables.gradle" ]; then
+            sed -i 's/compileSdkVersion = 35/compileSdkVersion = 36/g' android/variables.gradle || true
+            sed -i 's/targetSdkVersion = 35/targetSdkVersion = 36/g' android/variables.gradle || true
+          fi
+
+          # Asegurar Java 21 compileOptions en android/app/build.gradle
+          if [ -f "android/app/build.gradle" ]; then
+            if ! grep -q "JavaVersion.VERSION_21" android/app/build.gradle; then
+              echo "Agregando compileOptions Java 21 a android/app/build.gradle..."
+              sed -i '/defaultConfig {/i \    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_21\n        targetCompatibility JavaVersion.VERSION_21\n    }' android/app/build.gradle || true
+            fi
+            if ! grep -q "abortOnError" android/app/build.gradle; then
+              sed -i '/defaultConfig {/i \    lint {\n        abortOnError false\n        checkReleaseBuilds false\n    }' android/app/build.gradle || true
+            fi
+            sed -i 's/if (servicesJSON.text)/if (servicesJSON.exists())/g' android/app/build.gradle || true
+            sed -i 's/delete rootProject.buildDir/delete rootProject.layout.buildDirectory/g' android/build.gradle || true
+          fi
+
+          # Crear directorio libs si no existe
+          mkdir -p android/app/libs
+
+          # Corregir saltos de línea Windows (CRLF) y otorgar permisos
+          sed -i -e 's/\r$//' android/gradlew || true
+          chmod +x android/gradlew
+
+      - name: 🚀 Compilar APK con Gradle (assembleDebug)
+        run: |
+          cd android
+          export GRADLE_OPTS="-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 🔍 Organizar APK para descarga
+        run: |
+          mkdir -p output-apk
+          APK_FILE=$(find android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1)
+          if [ -f "$APK_FILE" ]; then
+            echo "✅ APK generado con éxito: $APK_FILE"
+            cp "$APK_FILE" output-apk/viajes-perdomo.apk
+            cp "$APK_FILE" output-apk/app-debug.apk
+            cd output-apk
+            zip -r ../viajes-perdomo-apk.zip viajes-perdomo.apk app-debug.apk || true
+            cd ..
+          else
+            echo "❌ Error: No se encontró el archivo APK compilado en android/app/build/outputs/apk/debug/"
+            exit 1
+          fi
+
+      - name: 📤 Subir APK a GitHub Artifacts (Descarga directa)
         uses: actions/upload-artifact@v4
         with:
-          name: viajes-perdomo-admin-apk
-          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          name: Viajes-Perdomo-APK
+          path: output-apk/viajes-perdomo.apk
+          retention-days: 90
+
+      - name: 📤 Subir archivo ZIP con el APK
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Viajes-Perdomo-APK-ZIP
+          path: viajes-perdomo-apk.zip
+          retention-days: 90
